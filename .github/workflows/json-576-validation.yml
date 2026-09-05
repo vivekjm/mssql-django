@@ -1,0 +1,87 @@
+name: Validate JSON lookup cleanup 576
+
+on:
+  push:
+    branches:
+      - maintenance/json-576-validation-20260906
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lookup-registry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: '3.10'
+            django: 'Django~=3.2.0'
+          - python: '3.11'
+            django: 'Django~=4.2.0'
+          - python: '3.12'
+            django: 'Django~=5.2.0'
+          - python: '3.13'
+            django: 'Django~=6.0.0'
+          - python: '3.13'
+            django: 'Django~=6.1.0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install actual Django and backend dependencies
+        env:
+          DJANGO_SPEC: ${{ matrix.django }}
+        run: python -m pip install "$DJANGO_SPEC" -e .
+      - name: Run the actual regression method and verify registry restoration
+        env:
+          DJANGO_SETTINGS_MODULE: testapp.settings
+        shell: bash
+        run: |
+          python - <<'PY'
+          import inspect
+          import textwrap
+          import django
+          from unittest.mock import patch
+
+          django.setup()
+          # Load the real backend so version-gated lookup delegation is installed.
+          from mssql.base import DatabaseWrapper
+          from django.db.models.fields.json import KeyTransform, KeyTransformExact
+          from testapp.tests.test_jsonfield import TestJSONField
+
+          name = 'test_json_null_iexact_uses_registered_exact_lookup'
+          case = TestJSONField(name)
+          original = KeyTransform.get_lookups()['exact']
+          assert original is KeyTransformExact
+          method = getattr(case, name)
+          for _ in range(5):
+              method()
+              assert KeyTransform.get_lookups()['exact'] is original
+
+          source = textwrap.dedent(inspect.getsource(getattr(TestJSONField, name)))
+          # Compile a temporary copy of the same test that fails inside the try
+          # block. This verifies the actual finally restoration, not a mock registry.
+          source = source[source.index('def '):]
+          source = source.replace('sql, params = lookup.as_sql(', 'raise RuntimeError("injected failure")\n        sql, params = lookup.as_sql(')
+          namespace = dict(getattr(TestJSONField, name).__globals__)
+          exec(compile(source, '<failure-path-regression>', 'exec'), namespace)
+          try:
+              namespace[name](case)
+          except RuntimeError as error:
+              assert str(error) == 'injected failure'
+          else:
+              raise AssertionError('Failure-path injection did not execute')
+          assert KeyTransform.get_lookups()['exact'] is original
+          print('Django', django.get_version(), ': actual dispatch test passed 5 repeated runs; exception cleanup restored exact lookup')
+          print('No SQL Server connection or database integration suite was run.')
+          PY
+      - name: Compile Python source and inspect whitespace
+        run: |
+          python -m compileall -q mssql testapp
+          git diff --check
