@@ -30,6 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: 56b20ce53a696e5d90ff6b455a871d0f612fbd64
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -47,7 +48,6 @@ jobs:
           import inspect
           import textwrap
           import django
-          from unittest.mock import patch
 
           django.setup()
           # Load the real backend so version-gated lookup delegation is installed.
