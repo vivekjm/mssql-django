@@ -34,6 +34,7 @@ jobs:
     defaults:
       run:
         working-directory: source
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
@@ -52,7 +53,6 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Install ODBC and backend dependencies
         run: |
-          set -euo pipefail
           curl -fsSL -o /tmp/ms-prod.deb "https://packages.microsoft.com/config/ubuntu/$(grep VERSION_ID /etc/os-release | cut -d '"' -f 2)/packages-microsoft-prod.deb"
           sudo dpkg -i /tmp/ms-prod.deb
           sudo apt-get update
@@ -62,7 +62,7 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
-          import os, time, pyodbc
+          import time, pyodbc
           Path('validation_settings.py').write_text('from testapp.settings import *\nfor alias in ("default", "other"):\n    DATABASES[alias]["OPTIONS"]["extra_params"] = "TrustServerCertificate=yes"\n')
           for attempt in range(30):
               try:
@@ -74,16 +74,16 @@ jobs:
                       raise
                   time.sleep(5)
           PY
-      - name: Add regressions and reproduce all three failures on the original PR
+      - name: Reproduce all three failures on the original PR
         run: |
           python ../harness/.github/scripts/pr576-review-fixes.py tests
           python - <<'PY'
           import subprocess
           from pathlib import Path
           tests = [
-              ('test_json_null_keys_preserve_trailing_spaces', 'FAIL:'),
-              ('test_json_null_keys_in_filtered_aggregates', '130'),
-              ('test_json_null_keys_in_grouped_case_annotations', '144'),
+              ('test_json_null_keys_preserve_trailing_spaces', 'AssertionError: Sequences differ'),
+              ('test_json_null_keys_in_filtered_aggregates', '(130)'),
+              ('test_json_null_keys_in_grouped_case_annotations', '(144)'),
           ]
           for name, expected in tests:
               command = ['python', 'manage.py', 'test', 'testapp.tests.test_jsonfield.TestJSONField.' + name, '--settings=validation_settings', '--noinput', '-v', '2']
@@ -93,15 +93,15 @@ jobs:
               assert result.returncode != 0 and expected in result.stdout, result.stdout
           PY
       - name: Apply scoped compiler and key matching fixes
-        run: python ../harness/.github/scripts/pr576-review-fixes.py fix
+        run: python ../harness/.github/scripts/pr576-review-fixes.py fix 2>&1 | tee apply-fix.log
       - name: Run JSONField regressions against SQL Server and SQLite
-        run: python manage.py test testapp.tests.test_jsonfield --settings=validation_settings --noinput -v 2
+        run: python manage.py test testapp.tests.test_jsonfield --settings=validation_settings --noinput -v 2 2>&1 | tee jsonfield.log
       - name: Run complete owned backend test suite
-        run: python manage.py test testapp --settings=validation_settings --noinput -v 2
+        run: python manage.py test testapp --settings=validation_settings --noinput -v 2 2>&1 | tee testapp.log
       - name: Check Python source and changed-line lint
         run: |
           python -m compileall -q mssql testapp
-          flake8 testapp/tests/test_jsonfield.py
+          flake8 testapp/tests/test_jsonfield.py 2>&1 | tee lint-tests.log
           python - <<'PY'
           import re, subprocess
           patch = subprocess.check_output(['git', 'diff', '--unified=0', '--', 'mssql/compiler.py', 'mssql/functions.py'], text=True)
@@ -143,6 +143,10 @@ jobs:
             source/validated-changes.json
             source/validated.patch
             source/baseline-*.log
+            source/apply-fix.log
+            source/jsonfield.log
+            source/testapp.log
+            source/lint-tests.log
           retention-days: 7
   stage-candidate:
     needs: sqlserver
@@ -155,7 +159,7 @@ jobs:
         with:
           pattern: mssql-576-*-20260916
           path: results
-      - name: Stage only identical candidates that passed every matrix job
+      - name: Stage identical candidates that passed every matrix job
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
