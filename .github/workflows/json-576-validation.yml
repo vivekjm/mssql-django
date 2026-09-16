@@ -1,87 +1,183 @@
-name: Validate JSON lookup cleanup 576
-
+name: Validate JSON review fixes 576
 on:
   push:
-    branches:
-      - maintenance/json-576-validation-20260906
+    branches: [maintenance/json-576-validation-20260906]
   workflow_dispatch:
-
 permissions:
   contents: read
-
+env:
+  PR_HEAD: 022216788e9510b8c8ec638313cc24e6aad0b63c
 jobs:
-  lookup-registry:
+  sqlserver:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         include:
-          - python: '3.10'
-            django: 'Django~=3.2.0'
-          - python: '3.11'
-            django: 'Django~=4.2.0'
-          - python: '3.12'
-            django: 'Django~=5.2.0'
-          - python: '3.13'
-            django: 'Django~=6.0.0'
-          - python: '3.13'
-            django: 'Django~=6.1.0'
+          - {python: '3.10', django: '3.2', spec: 'Django~=3.2.0'}
+          - {python: '3.12', django: '5.2', spec: 'Django~=5.2.0'}
+          - {python: '3.13', django: '6.1', spec: 'Django~=6.1.0'}
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2025-latest
+        env:
+          ACCEPT_EULA: 'Y'
+          MSSQL_SA_PASSWORD: MyPassword42
+        ports: ['1433:1433']
+    env:
+      MSSQL_PASSWORD: MyPassword42
+      MSSQL_HOST: 127.0.0.1
+      MSSQL_DRIVER: ODBC Driver 18 for SQL Server
+      DJANGO_SETTINGS_MODULE: validation_settings
+      DJANGO_SPEC: ${{ matrix.spec }}
+    defaults:
+      run:
+        working-directory: source
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 56b20ce53a696e5d90ff6b455a871d0f612fbd64
+          ref: 022216788e9510b8c8ec638313cc24e6aad0b63c
+          path: source
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 71e03aceb927534ff9306581fc2df0816009aceb
+          path: harness
+          sparse-checkout: .github/scripts/pr576-review-fixes.py
+          sparse-checkout-cone-mode: false
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - name: Install actual Django and backend dependencies
-        env:
-          DJANGO_SPEC: ${{ matrix.django }}
-        run: python -m pip install "$DJANGO_SPEC" -e .
-      - name: Run the actual regression method and verify registry restoration
-        env:
-          DJANGO_SETTINGS_MODULE: testapp.settings
-        shell: bash
+      - name: Install ODBC and backend dependencies
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/ms-prod.deb "https://packages.microsoft.com/config/ubuntu/$(grep VERSION_ID /etc/os-release | cut -d '"' -f 2)/packages-microsoft-prod.deb"
+          sudo dpkg -i /tmp/ms-prod.deb
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc-dev
+          python -m pip install -e '.[test]' "$DJANGO_SPEC" flake8
+      - name: Configure isolated test connections and await SQL Server
         run: |
           python - <<'PY'
-          import inspect
-          import textwrap
-          import django
-
-          django.setup()
-          # Load the real backend so version-gated lookup delegation is installed.
-          from mssql.base import DatabaseWrapper
-          from django.db.models.fields.json import KeyTransform, KeyTransformExact
-          from testapp.tests.test_jsonfield import TestJSONField
-
-          name = 'test_json_null_iexact_uses_registered_exact_lookup'
-          case = TestJSONField(name)
-          original = KeyTransform.get_lookups()['exact']
-          assert original is KeyTransformExact
-          method = getattr(case, name)
-          for _ in range(5):
-              method()
-              assert KeyTransform.get_lookups()['exact'] is original
-
-          source = textwrap.dedent(inspect.getsource(getattr(TestJSONField, name)))
-          # Compile a temporary copy of the same test that fails inside the try
-          # block. This verifies the actual finally restoration, not a mock registry.
-          source = source[source.index('def '):]
-          source = source.replace('sql, params = lookup.as_sql(', 'raise RuntimeError("injected failure")\n        sql, params = lookup.as_sql(')
-          namespace = dict(getattr(TestJSONField, name).__globals__)
-          exec(compile(source, '<failure-path-regression>', 'exec'), namespace)
-          try:
-              namespace[name](case)
-          except RuntimeError as error:
-              assert str(error) == 'injected failure'
-          else:
-              raise AssertionError('Failure-path injection did not execute')
-          assert KeyTransform.get_lookups()['exact'] is original
-          print('Django', django.get_version(), ': actual dispatch test passed 5 repeated runs; exception cleanup restored exact lookup')
-          print('No SQL Server connection or database integration suite was run.')
+          from pathlib import Path
+          import os, time, pyodbc
+          Path('validation_settings.py').write_text('from testapp.settings import *\nfor alias in ("default", "other"):\n    DATABASES[alias]["OPTIONS"]["extra_params"] = "TrustServerCertificate=yes"\n')
+          for attempt in range(30):
+              try:
+                  connection = pyodbc.connect('DRIVER={ODBC Driver 18 for SQL Server};SERVER=127.0.0.1,1433;UID=sa;PWD=MyPassword42;DATABASE=master;TrustServerCertificate=yes', timeout=5)
+                  connection.close()
+                  break
+              except pyodbc.Error:
+                  if attempt == 29:
+                      raise
+                  time.sleep(5)
           PY
-      - name: Compile Python source and inspect whitespace
+      - name: Add regressions and reproduce all three failures on the original PR
+        run: |
+          python ../harness/.github/scripts/pr576-review-fixes.py tests
+          python - <<'PY'
+          import subprocess
+          from pathlib import Path
+          tests = [
+              ('test_json_null_keys_preserve_trailing_spaces', 'FAIL:'),
+              ('test_json_null_keys_in_filtered_aggregates', '130'),
+              ('test_json_null_keys_in_grouped_case_annotations', '144'),
+          ]
+          for name, expected in tests:
+              command = ['python', 'manage.py', 'test', 'testapp.tests.test_jsonfield.TestJSONField.' + name, '--settings=validation_settings', '--noinput', '-v', '2']
+              result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              Path('baseline-' + name + '.log').write_text(result.stdout)
+              print(name, 'exit=', result.returncode, 'expected marker=', expected)
+              assert result.returncode != 0 and expected in result.stdout, result.stdout
+          PY
+      - name: Apply scoped compiler and key matching fixes
+        run: python ../harness/.github/scripts/pr576-review-fixes.py fix
+      - name: Run JSONField regressions against SQL Server and SQLite
+        run: python manage.py test testapp.tests.test_jsonfield --settings=validation_settings --noinput -v 2
+      - name: Run complete owned backend test suite
+        run: python manage.py test testapp --settings=validation_settings --noinput -v 2
+      - name: Check Python source and changed-line lint
         run: |
           python -m compileall -q mssql testapp
+          flake8 testapp/tests/test_jsonfield.py
+          python - <<'PY'
+          import re, subprocess
+          patch = subprocess.check_output(['git', 'diff', '--unified=0', '--', 'mssql/compiler.py', 'mssql/functions.py'], text=True)
+          changed, path = {}, None
+          for line in patch.splitlines():
+              if line.startswith('+++ b/'):
+                  path = line[6:]
+              match = re.match(r'@@ .* \+(\d+)(?:,(\d+))? @@', line)
+              if match:
+                  start, length = int(match[1]), int(match[2] or 1)
+                  changed.setdefault(path, set()).update(range(start, start + length))
+          result = subprocess.run(['flake8', 'mssql/compiler.py', 'mssql/functions.py'], text=True, stdout=subprocess.PIPE)
+          errors = []
+          for line in result.stdout.splitlines():
+              parts = line.split(':', 3)
+              if len(parts) >= 3 and int(parts[1]) in changed.get(parts[0], set()):
+                  errors.append(line)
+          assert not errors, '\n'.join(errors)
+          print('No Flake8 diagnostics on changed production lines.')
+          PY
           git diff --check
+      - name: Collect validated candidate
+        run: |
+          python - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          allowed = {'mssql/compiler.py', 'mssql/functions.py', 'testapp/tests/test_jsonfield.py'}
+          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
+          assert changed == allowed, changed
+          report = {'base_tree': subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip(), 'parents': [os.environ['PR_HEAD']], 'files': [{'path': path, 'mode': '100644', 'type': 'blob', 'content': Path(path).read_text()} for path in sorted(allowed)]}
+          Path('validated-changes.json').write_text(json.dumps(report, indent=2))
+          Path('validated.patch').write_bytes(subprocess.check_output(['git', 'diff', '--', *sorted(allowed)]))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: mssql-576-${{ matrix.django }}-20260916
+          path: |
+            source/validated-changes.json
+            source/validated.patch
+            source/baseline-*.log
+          retention-days: 7
+  stage-candidate:
+    needs: sqlserver
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mssql-576-*-20260916
+          path: results
+      - name: Stage only identical candidates that passed every matrix job
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request
+          from pathlib import Path
+          manifests = sorted(Path('results').glob('*/validated-changes.json'))
+          assert len(manifests) == 3
+          reports = [json.loads(path.read_text()) for path in manifests]
+          assert all(report == reports[0] for report in reports)
+          report = reports[0]
+          assert report['parents'] == [os.environ['PR_HEAD']]
+          assert {file['path'] for file in report['files']} == {'mssql/compiler.py', 'mssql/functions.py', 'testapp/tests/test_jsonfield.py'}
+          root = 'https://api.github.com/repos/vivekjm/mssql-django/'
+          def request(path, data=None):
+              headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'}
+              req = urllib.request.Request(root + path, data=None if data is None else json.dumps(data).encode(), headers=headers, method='GET' if data is None else 'POST')
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  return json.load(response)
+          assert request('git/ref/heads/fix/json-key-iexact-null')['object']['sha'] == os.environ['PR_HEAD']
+          tree = request('git/trees', {'base_tree': report['base_tree'], 'tree': report['files']})
+          commit = request('git/commits', {'message': 'fix: preserve JSON key identity and lift null indicators out of aggregates', 'tree': tree['sha'], 'parents': report['parents']})
+          request('git/refs', {'ref': 'refs/heads/maintenance/json-576-validated-20260916', 'sha': commit['sha']})
+          print('CANDIDATE_SHA=' + commit['sha'])
+          PY
