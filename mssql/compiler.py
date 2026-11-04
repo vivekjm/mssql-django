@@ -268,13 +268,20 @@ compiler.cursor_iter = _cursor_iter
 
 class SQLCompiler(compiler.SQLCompiler):
 
-    def _compile_json_null_predicate(self, sql, params):
-        # SELECT/GROUP BY and aggregate expressions cannot contain scalar
-        # subqueries on SQL Server. Evaluate the nullable indicator in FROM.
+    def _compile_json_null_predicate(self, sql, params, contains_aggregate=False):
+        if getattr(self, '_json_null_check_constraint', False):
+            raise NotSupportedError(
+                'JSON-null key lookups are not supported in SQL Server CHECK constraints.'
+            )
+        # SQL Server rejects scalar subqueries inside aggregates and GROUP BY.
+        # Evaluate row-level nullable indicators in FROM instead.
         applies = getattr(self, '_json_null_applies', None)
-        if applies is None:
+        if applies is None or contains_aggregate:
             # UPDATE/DELETE and callers compiling expressions on their own do
             # not have a SELECT FROM clause to attach an APPLY to.
+            # Aggregate-dependent predicates must also stay in their SELECT or
+            # HAVING scope; lifting them into APPLY makes the aggregate refer
+            # to columns from the left side (SQL Server error 4101).
             return '(%s) = 1' % sql, params
         params = tuple(params)
         for alias, existing_sql, existing_params in applies:
@@ -302,6 +309,16 @@ class SQLCompiler(compiler.SQLCompiler):
             ))
             params.extend(sql_params)
         return clauses, params
+
+    def get_from_clause(self):
+        # JOIN ON predicates cannot reference an APPLY alias declared after
+        # the join. Keep their JSON-null subqueries local to the ON clause.
+        previous_applies = getattr(self, '_json_null_applies', None)
+        self._json_null_applies = None
+        try:
+            return super().get_from_clause()
+        finally:
+            self._json_null_applies = previous_applies
 
     def _resolve_order_by_source_expression(self, expression, dereference_ref=True):
         if expression is None:

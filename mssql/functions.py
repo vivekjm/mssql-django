@@ -448,6 +448,7 @@ def json_KeyTransformExact(self, compiler, connection):
                 "WHERE LEFT(LTRIM([parent].[json]), 1) = '[' "
                 "AND [item].[key] = %%s" % parent_json,
                 tuple(lhs_params) + (str(final_index),),
+                contains_aggregate=self.lhs.contains_aggregate,
             )
 
         if key_transforms:
@@ -464,6 +465,7 @@ def json_KeyTransformExact(self, compiler, connection):
             "FROM %s WHERE [key] = %%s "
             "AND DATALENGTH([key]) = DATALENGTH(CAST(%%s AS nvarchar(max)))" % openjson,
             tuple(lhs_params) + (final_key, final_key),
+            contains_aggregate=self.lhs.contains_aggregate,
         )
     return self.as_sql(compiler, connection)
 
@@ -618,6 +620,8 @@ def _get_check_sql(self, model, schema_editor):
         # use check for backwards compatibility    
         where = query.build_where(self.check)    
     compiler = query.get_compiler(connection=schema_editor.connection)
+    if schema_editor.connection.vendor == 'microsoft':
+        compiler._json_null_check_constraint = True
     sql, params = where.as_sql(compiler, schema_editor.connection)
     if schema_editor.connection.vendor == 'microsoft':
         try:

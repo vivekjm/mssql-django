@@ -1,16 +1,20 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the BSD license.
 
+import json
 from unittest import skipUnless
+from unittest.mock import patch
 
 from django import VERSION
 from django.db import NotSupportedError, connections
-from django.db.models import Case, Count, IntegerField, JSONField, Q, Value, When
+from django.db.models import (
+    Case, CheckConstraint, Count, FilteredRelation, IntegerField, JSONField, Max, Q, Value, When,
+)
 from django.test import TestCase, skipUnlessDBFeature
 from django.test.utils import CaptureQueriesContext
 
 if VERSION >= (3, 1):
-    from ..models import JSONModel
+    from ..models import Author, JSONModel, Post
 
 
 def _check_jsonfield_supported_sqlite():
@@ -186,6 +190,57 @@ class TestJSONField(TestCase):
             # whose key resolves to a non-null JSON value.
             self.assertSequenceEqual(included, [missing])
             self.assertSequenceEqual(excluded, [json_null, present])
+
+    @skipUnlessDBFeature('supports_json_openjson')
+    def test_json_null_keys_in_check_constraints_not_supported(self):
+        schema_editor = connections['default'].schema_editor()
+        for lookup in ('value__key', 'value__nested__key', 'value__0', 'value__items__0'):
+            with self.subTest(lookup=lookup):
+                condition = Q(**{lookup: None})
+                kwargs = {'condition' if VERSION >= (5, 1) else 'check': condition}
+                constraint = CheckConstraint(name='json_null_key', **kwargs)
+                with self.assertRaisesMessage(
+                    NotSupportedError,
+                    'JSON-null key lookups are not supported in SQL Server CHECK constraints.',
+                ):
+                    constraint._get_check_sql(JSONModel, schema_editor)
+
+    @skipUnlessDBFeature('supports_json_openjson')
+    def test_json_null_keys_in_join_predicates(self):
+        for key, values in (
+            ('key', [{'key': None}, {'key': 1}, {}]),
+            ('nested__key', [{'nested': {'key': None}}, {'nested': {'key': 1}}, {}]),
+            ('0', [[None], [1], []]),
+            ('items__0', [{'items': [None]}, {'items': [1]}, {}]),
+        ):
+            with self.subTest(key=key):
+                authors = [Author.objects.create(name=str(index)) for index in range(3)]
+                for author, value in zip(authors, values):
+                    Post.objects.create(author=author, title=json.dumps(value))
+                # Exercise JSON transforms in a real related table's ON clause
+                # using JSON text in the existing title field.
+                with patch.object(Post._meta.get_field('title'), 'get_transform', JSONField().get_transform):
+                    queryset = Author.objects.filter(pk__in=[author.pk for author in authors]).annotate(
+                        null_post=FilteredRelation('post', condition=Q(**{'post__title__' + key: None})),
+                    ).filter(null_post__isnull=False)
+                    self.assertSequenceEqual(queryset, authors[:1])
+
+    @skipUnlessDBFeature('supports_json_openjson')
+    def test_json_null_keys_in_aggregate_dependent_lookups(self):
+        for key, values in (
+            ('key', [{'key': None}, {'key': 1}, {}]),
+            ('nested__key', [{'nested': {'key': None}}, {'nested': {'key': 1}}, {}]),
+            ('0', [[None], [1], []]),
+            ('items__0', [{'items': [None]}, {'items': [1]}, {}]),
+        ):
+            with self.subTest(key=key):
+                rows = [JSONModel.objects.create(value=value) for value in values]
+                queryset = JSONModel.objects.filter(pk__in=[row.pk for row in rows]).values('pk').annotate(
+                    payload=Max('value', output_field=JSONField()),
+                )
+                condition = {'payload__' + key: None}
+                self.assertSequenceEqual(queryset.filter(**condition).values_list('pk', flat=True), [rows[0].pk])
+                self.assertSequenceEqual(queryset.exclude(**condition).values_list('pk', flat=True), [rows[1].pk])
 
     @skipUnlessDBFeature('supports_json_openjson')
     def test_json_null_keys_preserve_trailing_spaces(self):
