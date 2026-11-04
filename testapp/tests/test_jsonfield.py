@@ -192,6 +192,55 @@ class TestJSONField(TestCase):
             self.assertSequenceEqual(excluded, [json_null, present])
 
     @skipUnlessDBFeature('supports_json_openjson')
+    @skipUnless(VERSION >= (4, 1), 'Q.check() requires Django 4.1 or newer')
+    def test_json_null_keys_in_tableless_validation(self):
+        for key, values in (
+            ('key', [{'key': None}, {'key': 1}, {}]),
+            ('nested__key', [{'nested': {'key': None}}, {'nested': {'key': 1}}, {}]),
+            ('0', [[None], [1], []]),
+            ('items__0', [{'items': [None]}, {'items': [1]}, {}]),
+        ):
+            for value, expected in zip(values, (True, False, False)):
+                with self.subTest(key=key, value=value):
+                    # Q.check() returns True after DatabaseError. Check logging
+                    # too so an invalid matching query cannot silently pass.
+                    with patch('django.db.models.query_utils.logger.warning') as warning:
+                        result = Q(**{'value__' + key: None}).check({
+                            'value': Value(value, output_field=JSONField()),
+                        })
+                    warning.assert_not_called()
+                    self.assertIs(result, expected)
+
+    @skipUnlessDBFeature('supports_json_openjson')
+    def test_json_null_keys_alongside_grouped_aggregates(self):
+        for key, values in (
+            ('key', [{'key': None}, {'key': 1}, {}]),
+            ('nested__key', [{'nested': {'key': None}}, {'nested': {'key': 1}}, {}]),
+            ('0', [[None], [1], []]),
+            ('items__0', [{'items': [None]}, {'items': [1]}, {}]),
+        ):
+            with self.subTest(key=key):
+                rows = [JSONModel.objects.create(value=value) for value in values]
+                condition = Q(**{'value__' + key: None})
+                queryset = JSONModel.objects.filter(pk__in=[row.pk for row in rows]).values('pk').annotate(
+                    n=Count('pk'), null_count=Count('pk', filter=condition),
+                )
+                self.assertSequenceEqual(
+                    queryset.filter(Q(n__gte=2) | condition).values_list('pk', flat=True), [rows[0].pk],
+                )
+                flagged = queryset.annotate(flag=Case(
+                    When(Q(n__gte=1) & condition, then=Value(1)),
+                    default=Value(0), output_field=IntegerField(),
+                )).order_by('pk')
+                self.assertSequenceEqual(flagged.values_list('flag', flat=True), [1, 0, 0])
+                # Aggregate filters use row indicators without splitting the
+                # chosen group into separate null/non-null/missing groups.
+                grouped = JSONModel.objects.filter(pk__in=[row.pk for row in rows]).annotate(
+                    bucket=Value(1, output_field=IntegerField()),
+                ).values('bucket').annotate(n=Count('pk'), null_count=Count('pk', filter=condition))
+                self.assertSequenceEqual(grouped, [{'bucket': 1, 'n': 3, 'null_count': 1}])
+
+    @skipUnlessDBFeature('supports_json_openjson')
     def test_json_null_keys_in_check_constraints_not_supported(self):
         schema_editor = connections['default'].schema_editor()
         for lookup in ('value__key', 'value__nested__key', 'value__0', 'value__items__0'):

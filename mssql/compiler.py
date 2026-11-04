@@ -6,7 +6,7 @@ from functools import partial
 from itertools import chain
 
 import django
-from django.db.models.aggregates import Avg, Count, StdDev, Variance
+from django.db.models.aggregates import Aggregate, Avg, Count, StdDev, Variance
 from django.db.models import AutoField
 if django.VERSION >= (6, 0):
     from django.db.models.aggregates import StringAgg
@@ -284,8 +284,11 @@ class SQLCompiler(compiler.SQLCompiler):
             # to columns from the left side (SQL Server error 4101).
             return '(%s) = 1' % sql, params
         params = tuple(params)
+        grouping_aliases = getattr(self, '_json_null_grouping_aliases', None)
         for alias, existing_sql, existing_params in applies:
             if sql == existing_sql and params == existing_params:
+                if grouping_aliases is not None and getattr(self, '_json_null_requires_grouping', False):
+                    grouping_aliases.add(alias)
                 return '%s.[value] = 1' % self.connection.ops.quote_name(alias), ()
         used_aliases = {
             alias.lower() for alias in (
@@ -299,6 +302,8 @@ class SQLCompiler(compiler.SQLCompiler):
             index += 1
             alias = '__mssql_json_null_%d' % index
         applies.append((alias, sql, params))
+        if grouping_aliases is not None and getattr(self, '_json_null_requires_grouping', False):
+            grouping_aliases.add(alias)
         return '%s.[value] = 1' % self.connection.ops.quote_name(alias), ()
 
     def _get_json_null_apply_clauses(self):
@@ -377,6 +382,8 @@ class SQLCompiler(compiler.SQLCompiler):
         """
         refcounts_before = self.query.alias_refcount.copy()
         previous_applies = getattr(self, '_json_null_applies', None)
+        previous_grouping_aliases = getattr(self, '_json_null_grouping_aliases', None)
+        self._json_null_grouping_aliases = set()
         self._json_null_applies = []
         try:
             extra_select, order_by, group_by = self.pre_sql_setup()
@@ -536,6 +543,10 @@ class SQLCompiler(compiler.SQLCompiler):
                     from_.insert(1, for_update_part)
 
                 applies, apply_params = self._get_json_null_apply_clauses()
+                if applies and not from_:
+                    # Q.check() and validation compile SELECTs without a model.
+                    # APPLY needs a left input even when its JSON is a literal.
+                    from_.append('(SELECT 1 AS [value]) AS [__mssql_json_source]')
                 from_.extend(applies)
                 f_params.extend(apply_params)
                 result += [', '.join(out_cols)]
@@ -551,6 +562,8 @@ class SQLCompiler(compiler.SQLCompiler):
                 for g_sql, g_params in group_by:
                     grouping.append(g_sql)
                     params.extend(g_params)
+                for alias in sorted(self._json_null_grouping_aliases):
+                    grouping.append('%s.[value]' % self.connection.ops.quote_name(alias))
                 if grouping:
                     if distinct_fields:
                         raise NotImplementedError('annotate() + distinct(fields) is not implemented.')
@@ -726,10 +739,22 @@ class SQLCompiler(compiler.SQLCompiler):
             # Finally do cleanup - get rid of the joins we created above.
             self.query.reset_refcounts(refcounts_before)
             self._json_null_applies = previous_applies
+            self._json_null_grouping_aliases = previous_grouping_aliases
 
     def compile(self, node, *args, **kwargs):
-        node = self._as_microsoft(node)
-        return super().compile(node, *args, **kwargs)
+        previous_grouping = getattr(self, '_json_null_requires_grouping', False)
+        # Row-level predicates alongside aggregates (including mixed HAVING)
+        # need their APPLY result grouped. Predicates inside an aggregate's
+        # arguments/filter must remain per-row and must not split its groups.
+        if isinstance(node, Aggregate):
+            self._json_null_requires_grouping = False
+        elif getattr(node, 'contains_aggregate', False):
+            self._json_null_requires_grouping = True
+        try:
+            node = self._as_microsoft(node)
+            return super().compile(node, *args, **kwargs)
+        finally:
+            self._json_null_requires_grouping = previous_grouping
 
     def collapse_group_by(self, expressions, having):
         expressions = super().collapse_group_by(expressions, having)
