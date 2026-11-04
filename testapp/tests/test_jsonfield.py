@@ -126,6 +126,7 @@ class TestJSONField(TestCase):
         )
 
     @skipUnless(VERSION >= (3, 1), "JSONField not supported in Django versions < 3.1")
+    @skipUnlessDBFeature('supports_json_openjson')
     def test_json_null_key_lookups(self):
         present = JSONModel.objects.create(
             value={"nullable": None, "nested": {"nullable": None}}
@@ -260,6 +261,7 @@ class TestJSONField(TestCase):
                 )
 
     @skipUnless(VERSION >= (3, 1), "JSONField not supported in Django versions < 3.1")
+    @skipUnlessDBFeature('supports_json_openjson')
     def test_json_null_numeric_key_uses_array_index_semantics(self):
         array_null = JSONModel.objects.create(value=[None])
         nested_array_null = JSONModel.objects.create(value={"items": [None]})
