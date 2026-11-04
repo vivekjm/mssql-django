@@ -9,7 +9,8 @@ from django.conf import settings
 from django.core import validators
 from django.db import NotSupportedError, connections, transaction
 from django.db.models import BooleanField, CheckConstraint, Q, Value
-from django.db.models.expressions import Case, Exists, OrderBy, Subquery, When, Window
+from django.db.models.aggregates import Aggregate
+from django.db.models.expressions import Case, Exists, OrderBy, Ref, Subquery, When, Window
 from django.db.models.fields import BinaryField, Field
 from django.db.models.functions import Cast, NthValue, MD5, SHA1, SHA224, SHA256, SHA384, SHA512
 from django.db.models.functions.datetime import Now
@@ -409,6 +410,20 @@ def json_KeyTransformExact_process_rhs(self, compiler, connection):
     return rhs, rhs_params
 
 
+def _contains_local_aggregate(expression):
+    # Ref is a column produced by an inner query. Its source retains the
+    # original aggregate for Django's expression bookkeeping, but is no
+    # longer an aggregate in the current SQL scope.
+    if isinstance(expression, Ref):
+        return False
+    if isinstance(expression, Aggregate):
+        return True
+    return any(
+        _contains_local_aggregate(source)
+        for source in expression.get_source_expressions() if source is not None
+    )
+
+
 def json_KeyTransformExact(self, compiler, connection):
     """Match an existing JSON key whose value is the JSON null literal."""
     if (
@@ -448,7 +463,7 @@ def json_KeyTransformExact(self, compiler, connection):
                 "WHERE LEFT(LTRIM([parent].[json]), 1) = '[' "
                 "AND [item].[key] = %%s" % parent_json,
                 tuple(lhs_params) + (str(final_index),),
-                contains_aggregate=self.lhs.contains_aggregate,
+                contains_aggregate=_contains_local_aggregate(self.lhs),
             )
 
         if key_transforms:
@@ -465,7 +480,7 @@ def json_KeyTransformExact(self, compiler, connection):
             "FROM %s WHERE [key] = %%s "
             "AND DATALENGTH([key]) = DATALENGTH(CAST(%%s AS nvarchar(max)))" % openjson,
             tuple(lhs_params) + (final_key, final_key),
-            contains_aggregate=self.lhs.contains_aggregate,
+            contains_aggregate=_contains_local_aggregate(self.lhs),
         )
     return self.as_sql(compiler, connection)
 

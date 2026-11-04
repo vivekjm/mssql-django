@@ -8,8 +8,9 @@ from unittest.mock import patch
 from django import VERSION
 from django.db import NotSupportedError, connections
 from django.db.models import (
-    Case, CheckConstraint, Count, FilteredRelation, IntegerField, JSONField, Max, Q, Value, When,
+    Case, CheckConstraint, Count, FilteredRelation, IntegerField, JSONField, Max, Q, Value, When, Window,
 )
+from django.db.models.functions import RowNumber
 from django.test import TestCase, skipUnlessDBFeature
 from django.test.utils import CaptureQueriesContext
 
@@ -239,6 +240,89 @@ class TestJSONField(TestCase):
                     bucket=Value(1, output_field=IntegerField()),
                 ).values('bucket').annotate(n=Count('pk'), null_count=Count('pk', filter=condition))
                 self.assertSequenceEqual(grouped, [{'bucket': 1, 'n': 3, 'null_count': 1}])
+
+    @skipUnlessDBFeature('supports_json_openjson')
+    def test_json_null_grouped_case_inside_aggregate_expression(self):
+        for key, values in (
+            ('key', [{'key': None}, {'key': 1}, {}]),
+            ('nested__key', [{'nested': {'key': None}}, {'nested': {'key': 1}}, {}]),
+            ('0', [[None], [1], []]),
+            ('items__0', [{'items': [None]}, {'items': [1]}, {}]),
+        ):
+            with self.subTest(key=key):
+                rows = [JSONModel.objects.create(value=value) for value in values]
+                condition = Q(**{'value__' + key: None})
+                grouped = JSONModel.objects.filter(pk__in=[row.pk for row in rows]).annotate(
+                    bucket=Value(1, output_field=IntegerField()),
+                ).values('bucket').annotate(n=Count('pk') + Case(
+                    When(condition, then=Value(1)), default=Value(0), output_field=IntegerField(),
+                ))
+                compiler = grouped.query.get_compiler(using='default')
+                sql, params = compiler.as_sql()
+                self.assertEqual((sql, params), compiler.as_sql())
+                # The CASE groups missing and non-null together. Grouping by
+                # its raw nullable indicator as well would split that group.
+                self.assertTrue(sql.split(' GROUP BY ', 1)[1].endswith('ELSE %s END'))
+                self.assertCountEqual(grouped, [{'bucket': 1, 'n': 2}, {'bucket': 1, 'n': 2}])
+
+    @skipUnlessDBFeature('supports_json_openjson')
+    def test_json_null_filtered_aggregate_over_materialized_aggregate(self):
+        for key, values in (
+            ('key', [{'key': None}, {'key': 1}, {}]),
+            ('nested__key', [{'nested': {'key': None}}, {'nested': {'key': 1}}, {}]),
+            ('0', [[None], [1], []]),
+            ('items__0', [{'items': [None]}, {'items': [1]}, {}]),
+        ):
+            with self.subTest(key=key):
+                rows = [JSONModel.objects.create(value=value) for value in values]
+                queryset = JSONModel.objects.filter(pk__in=[row.pk for row in rows]).values('pk').annotate(
+                    payload=Max('value', output_field=JSONField()),
+                )
+                condition = Q(**{'payload__' + key: None})
+                self.assertEqual(queryset.aggregate(
+                    null_count=Count('payload', filter=condition),
+                    non_null_count=Count('payload', filter=~condition),
+                ), {'null_count': 1, 'non_null_count': 1})
+
+    @skipUnless(VERSION >= (4, 2), 'Filtering against window functions requires Django 4.2')
+    @skipUnlessDBFeature('supports_json_openjson', 'supports_over_clause')
+    def test_json_null_keys_across_window_filter_rewrites(self):
+        for key, values in (
+            ('key', [{'key': None}, {'key': 1}, {}, {'key': 'null'}]),
+            ('nested__key', [{'nested': {'key': None}}, {'nested': {'key': 1}}, {}, {'nested': {'key': 'null'}}]),
+            ('0', [[None], [1], [], ['null']]),
+            ('items__0', [{'items': [None]}, {'items': [1]}, {}, {'items': ['null']}]),
+        ):
+            with self.subTest(key=key):
+                rows = [JSONModel.objects.create(value=value) for value in values]
+                queryset = JSONModel.objects.filter(pk__in=[row.pk for row in rows]).annotate(
+                    rn=Window(RowNumber(), order_by='pk'),
+                )
+                condition = Q(**{'value__' + key: None})
+                # The OR forces the JSON predicate into the outer window
+                # filtering query. Mask the document to exercise extra selects.
+                included = queryset.filter(Q(rn__lte=0) | condition).values_list('pk', flat=True)
+                compiler = included.query.get_compiler(using='default')
+                self.assertEqual(compiler.as_sql(), compiler.as_sql())
+                self.assertSequenceEqual(included, [rows[0].pk])
+                if VERSION >= (6, 1):
+                    self.assertSequenceEqual(
+                        queryset.filter(
+                            Q(rn__lte=0) | Q(**{'value__' + key + '__iexact': None}),
+                        ).values_list('pk', flat=True),
+                        [rows[0].pk],
+                    )
+                self.assertSequenceEqual(
+                    queryset.filter(Q(rn__lte=0) | ~condition).order_by('pk').values_list('pk', flat=True),
+                    [rows[1].pk, rows[3].pk],
+                )
+                window_payload = queryset.annotate(
+                    payload=Window(Max('value', output_field=JSONField()), partition_by='pk'),
+                )
+                self.assertSequenceEqual(
+                    window_payload.filter(**{'payload__' + key: None}).values_list('pk', flat=True),
+                    [rows[0].pk],
+                )
 
     @skipUnlessDBFeature('supports_json_openjson')
     def test_json_null_keys_in_check_constraints_not_supported(self):
